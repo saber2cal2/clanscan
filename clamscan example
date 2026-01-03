@@ -1,0 +1,7 @@
+sudo clamscan -r /home /var/www /srv /etc \
+  --log=/var/log/clamav/targeted_low_fp_scan.log \
+  --infected \
+  --verbose \
+  --exclude-dir="^/proc|^/sys|^/dev|^/run|^/var/lib/docker|^/var/lib/clamav|^/var/log/clamav|^/usr/local/maldetect|^/usr/lib64/chkrootkit|^/usr/share/nmap" \
+  --heuristic-scan-precedence=no \
+  --detect-pua=no
