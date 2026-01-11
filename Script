@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# -------- Settings (edit if you want) --------
+LOG_DIR="/var/log/clamav"
+TS="$(date +%F_%H%M%S)"
+SCAN_LOG="${LOG_DIR}/scan_${TS}.log"
+
+RAW_FOUND="${LOG_DIR}/scan_${TS}_found_raw.txt"
+FILTERED_FOUND="${LOG_DIR}/scan_${TS}_found_filtered.txt"
+SUSPECT_PATHS="${LOG_DIR}/scan_${TS}_suspect_paths.txt"
+QUAR_SCRIPT="${LOG_DIR}/scan_${TS}_action_quarantine.sh"
+
+# Directories to scan (tune to your environment)
+SCAN_TARGETS=(/home /var/www /srv /etc)
+
+# Directories to exclude (reduces false positives dramatically)
+# NOTE: Regex is for clamscan --exclude-dir
+EXCLUDE_DIR_REGEX='^/proc|^/sys|^/dev|^/run|^/var/lib/docker|^/var/lib/clamav|^/var/log/clamav|^/usr/local/maldetect|^/home/.*/linux-malware-detect|^/usr/lib64/chkrootkit|^/usr/share/nmap'
+
+# False-positive signature patterns to filter out of results
+# Add/remove patterns as you learn your environment.
+FP_SIG_REGEX='UNOFFICIAL|^PUA\.|^Heuristics\.|Eicar-Test-Signature'
+
+# Quarantine folder for *non-filtered* hits (manual review recommended)
+QUAR_DIR="/var/quarantine/clamav"
+# ---------------------------------------------
+
+sudo mkdir -p "$LOG_DIR"
+sudo chmod 750 "$LOG_DIR"
+
+echo "[*] Starting ClamAV scan..."
+echo "    Log: $SCAN_LOG"
+echo "    Targets: ${SCAN_TARGETS[*]}"
+echo "    Exclude regex: $EXCLUDE_DIR_REGEX"
+echo
+
+# Run scan
+sudo clamscan -r "${SCAN_TARGETS[@]}" \
+  --log="$SCAN_LOG" \
+  --infected \
+  --verbose \
+  --detect-pua=no \
+  --heuristic-scan-precedence=no \
+  --exclude-dir="$EXCLUDE_DIR_REGEX" || true
+
+echo "[*] Extracting detections..."
+sudo grep "FOUND$" "$SCAN_LOG" > "$RAW_FOUND" || true
+
+RAW_COUNT="$(wc -l < "$RAW_FOUND" || echo 0)"
+echo "    Raw detections: $RAW_COUNT"
+echo "    Raw list: $RAW_FOUND"
+
+echo "[*] Filtering known false positives (signatures matching: $FP_SIG_REGEX)"
+# Keep only hits that do NOT match FP signature regex
+if [[ -s "$RAW_FOUND" ]]; then
+  grep -Ev "$FP_SIG_REGEX" "$RAW_FOUND" > "$FILTERED_FOUND" || true
+else
+  : > "$FILTERED_FOUND"
+fi
+
+FILT_COUNT="$(wc -l < "$FILTERED_FOUND" || echo 0)"
+echo "    Filtered detections: $FILT_COUNT"
+echo "    Filtered list: $FILTERED_FOUND"
+echo
+
+# Extract suspect file paths (from filtered results)
+if [[ -s "$FILTERED_FOUND" ]]; then
+  awk -F: '{print $1}' "$FILTERED_FOUND" > "$SUSPECT_PATHS"
+else
+  : > "$SUSPECT_PATHS"
+fi
+
+echo "[*] Creating OPTIONAL quarantine action script (review before running): $QUAR_SCRIPT"
+sudo tee "$QUAR_SCRIPT" >/dev/null <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+QUAR_DIR="/var/quarantine/clamav"
+mkdir -p "$QUAR_DIR"
+echo "[*] Quarantine directory: $QUAR_DIR"
+EOF
+
+# Append quarantine commands for each remaining hit
+if [[ -s "$SUSPECT_PATHS" ]]; then
+  while IFS= read -r f; do
+    [[ -z "$f" ]] && continue
+    # Use cp -a to avoid breaking services; you can delete after confirming.
+    printf "cp -a -- %q %q 2>/dev/null || true\n" "$f" "$QUAR_DIR/" | sudo tee -a "$QUAR_SCRIPT" >/dev/null
+  done < "$SUSPECT_PATHS"
+fi
+
+sudo chmod +x "$QUAR_SCRIPT"
+
+echo
+echo "[✓] Done."
+echo "    Scan log:        $SCAN_LOG"
+echo "    Raw detections:  $RAW_FOUND"
+echo "    Filtered hits:   $FILTERED_FOUND"
+echo "    Suspect paths:   $SUSPECT_PATHS"
+echo "    Quarantine tool: $QUAR_SCRIPT"
+echo
+echo "Next steps:"
+echo "  - If Filtered hits = 0, you're clean (only false positives were found)."
+echo "  - If Filtered hits > 0, inspect each file and optionally run the quarantine script."
